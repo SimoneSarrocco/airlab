@@ -16,6 +16,9 @@
 import os, sys, time
 import torch as th
 import numpy as np
+import nibabel as nib
+import torch
+import matplotlib.pyplot as plt
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -38,21 +41,30 @@ def main():
     tmp_directory = "/tmp/"
 
     # load the image data and normalize intensities to [0, 1]
-    loader = al.ImageLoader(tmp_directory)
+    fixed_image = nib.load('/home/simone.sarrocco/OMEGA_study/data/OMEGA_cleaned/OMEGA06/R/V01/Spectralis_oct/OMEGA_06_295.nii.gz')
+    fixed_image_numpy = fixed_image.get_fdata().astype(np.float32)
+    fixed_image = torch.from_numpy(fixed_image_numpy).to(device)
+    # fixed_image_torch = (fixed_image_torch - fixed_image_torch.min()) / (fixed_image_torch.max() - fixed_image_torch.min())
+    print("Fixed image shape: ", fixed_image.shape)
+    print("Fixed image range: ", fixed_image.min(), fixed_image.max())
 
-    # Images:
-    p1_name = "4DCT_POPI_1"
-    p1_img_nr = "image_00"
-    p2_name = "4DCT_POPI_1"
-    p2_img_nr = "image_50"
+    moving_image = nib.load('/home/simone.sarrocco/OMEGA_study/data/OMEGA_cleaned/OMEGA06/R/V02/Spectralis_oct/OMEGA_06_264.nii.gz')
+    moving_image_numpy = moving_image.get_fdata().astype(np.float32)
+    moving_image = torch.from_numpy(moving_image_numpy).to(device)
+    # moving_image_torch = (moving_image_torch - moving_image_torch.min()) / (moving_image_torch.max() - moving_image_torch.min())
+    print("Moving image shape: ", moving_image.shape)
+    print("Moving image range: ", moving_image.min(), moving_image.max())
+
+    fixed_image = fixed_image.permute(2, 1, 0)
+    moving_image = moving_image.permute(2, 1, 0)
+
+    fixed_image = al.Image(fixed_image, [193, 496, 512], [1,1,1], [0,0,0])
+    moving_image = al.Image(moving_image, [193, 496, 512], [1,1,1], [0,0,0])
+
+    fixed_points = None
+    moving_points = None
 
     using_landmarks = True
-
-    print("loading images")
-    (fixed_image, fixed_points) = loader.load(p1_name, p1_img_nr)
-    (moving_image, moving_points) = loader.load(p2_name, p2_img_nr)
-    fixed_image.to(dtype, device)
-    moving_image.to(dtype, device)
 
     if fixed_points is None or moving_points is None:
         using_landmarks = False
@@ -69,15 +81,12 @@ def main():
     fixed_image, moving_image = al.utils.normalize_images(fixed_image, moving_image)
 
     # only perform center of mass alignment if inter subject registration is performed
-    if p1_name == p2_name:
-        cm_alignment = False
-    else:
-        cm_alignment = True
+    cm_alignment = False
 
     # Remove bed and auto-crop images
-    f_image, f_mask, m_image, m_mask, cm_displacement = al.get_joint_domain_images(fixed_image, moving_image,
+    f_image, m_image, _, _, cm_displacement = al.get_joint_domain_images(fixed_image, moving_image,
                                                                                    cm_alignment=cm_alignment,
-                                                                                   compute_masks=True)
+                                                                                   compute_masks=False)
 
     # align also moving points
     if not cm_displacement is None and using_landmarks:
@@ -90,9 +99,7 @@ def main():
 
     # create image pyramid size/8 size/4, size/2, size/1
     fixed_image_pyramid = al.create_image_pyramid(f_image, [[8, 8, 8], [4, 4, 4], [2, 2, 2]])
-    fixed_mask_pyramid = al.create_image_pyramid(f_mask, [[8, 8, 8], [4, 4, 4], [2, 2, 2]])
     moving_image_pyramid = al.create_image_pyramid(m_image, [[8, 8, 8], [4, 4, 4], [2, 2, 2]])
-    moving_mask_pyramid = al.create_image_pyramid(m_mask, [[8, 8, 8], [4, 4, 4], [2, 2, 2]])
 
     constant_flow = None
     regularisation_weight = [1e-2, 1e-1, 1e-0, 1e+2]
@@ -101,10 +108,8 @@ def main():
     step_size = [1e-2, 4e-3, 2e-3, 2e-3]
 
     print("perform registration")
-    for level, (mov_im_level, mov_msk_level, fix_im_level, fix_msk_level) in enumerate(zip(moving_image_pyramid,
-                                                                                           moving_mask_pyramid,
-                                                                                           fixed_image_pyramid,
-                                                                                           fixed_mask_pyramid)):
+    for level, (mov_im_level, fix_im_level) in enumerate(zip(moving_image_pyramid,
+                                                                                           fixed_image_pyramid,)):
 
         print("---- Level "+str(level)+" ----")
         registration = al.PairwiseRegistration()
@@ -126,7 +131,7 @@ def main():
         registration.set_transformation(transformation)
 
         # choose the Mean Squared Error as image loss
-        image_loss = al.loss.pairwise.MSE(fix_im_level, mov_im_level, mov_msk_level, fix_msk_level)
+        image_loss = al.loss.pairwise.MSE(fix_im_level, mov_im_level)
 
         registration.set_image_loss([image_loss])
 
