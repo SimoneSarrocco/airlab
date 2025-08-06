@@ -57,7 +57,7 @@ def compute_grid(image_size, dtype=th.float32, device='cpu'):
 
         return th.cat((x, y, z), 4).to(dtype=dtype, device=device)
     else:
-        print("Error " + dim + "is not a valid grid type")
+        print("Error " + str(dim) + " is not a valid grid type")
 
 
 def upsample_displacement(displacement, new_size, interpolation="linear"):
