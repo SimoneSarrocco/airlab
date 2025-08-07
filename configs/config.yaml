@@ -1,0 +1,36 @@
+# will create a experiment folder within the repo with date+run_name as subfolder
+run_name: "rigid_registration"
+
+# if its a json file, the local json datalist is used, else the path is used as a relative path within the lakefs branch
+input_path: "data"
+
+data:
+    train_test_already_split: False
+    folds: 1 # split the dataset into folds
+    k_fold: False # Trains all 5 folds when True
+    fold: 0 # If k_fold is False, only this fold will be trained
+    test_split: 0.2 # only used when train_test_already_split is false
+    img_tag: ".nii.gz" # the tag to look for, for mri images
+    lbl_tag: ".nii.gz" # the tag to look for in the labels
+    num_workers: 8
+    use_only_fraction_of_data: 1 # only takes a fraction of the available data for debugging, set 1 for normal
+
+model: #UNet
+    spatial_dims: 2
+    in_channels: 3
+    out_channels: 1
+    channels: [16, 32, 64, 128]
+    strides: [2, 2, 2]
+
+learning:
+    batch_size: 64
+    roi: [256, 256]
+    sw_batch_size: 4
+    infer_overlap: 0.625
+    max_epochs: 50
+    val_every: 5
+    checkpoint_every: 50
+
+    optimizer:
+        lr: 0.001
+        weight_decay: 0.00001

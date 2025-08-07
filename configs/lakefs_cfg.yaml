@@ -1,0 +1,7 @@
+data_repository: "omega-amd-3doct-faf-slo-fp"
+branch: "rigid_registration_oct_volumes/"
+cache_path: "./lakefs_cache/omega-amd-3doct-faf-slo-fp"
+s3_endpoint: "https://dbe-lakefs.dbe.unibas.ch:8000"
+access_key: ""
+secret_key: ""
+ca_path: ""

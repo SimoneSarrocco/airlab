@@ -12,13 +12,62 @@ import time
 import math
 import csv
 import glob
+import gc
+from lakefsimaged import LoadLakeFSImaged
+from lakefsloader import LakeFSLoader
 from monai.metrics.regression import PSNRMetric, SSIMMetric, MSEMetric
 from monai import transforms
 from nibabel.processing import resample_to_output
 import traceback
+from pathlib import Path
+import re
+from collections import defaultdict
+import yaml
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import airlab as al
+import datetime
+import shutil
+from datalist import DataList
 
+
+# dataset_df = pd.read_csv(args.dataset_csv)
+# train_df = dataset_df[ dataset_df.split == 'train' ]
+# train_df = train_df[~train_df['image_path'].str.contains("OMEGA04/L/V02")]
+# trainset = get_dataset_from_pd(train_df, transforms_fn, args.cache_dir)
+
+src_path = Path(__file__).parent
+project_path = src_path.parent
+
+config_path = 'configs/config.yaml'
+lakefs_config_path = 'configs/lakefs_cfg.yaml'
+
+with open(src_path / config_path) as f:
+    config = yaml.load(f, Loader=yaml.FullLoader)
+with open(src_path / lakefs_config_path) as f:
+    lakefs_config = yaml.load(f, Loader=yaml.FullLoader)
+
+
+# create the experiment folder, setup tensorboard, copy the used config
+current_datetime = datetime.datetime.now()
+timestamp = current_datetime.strftime("%Y-%m-%d-%H-%M-%S")
+experiment_name = config['run_name']
+use_cfg_fold = True
+use_fold = config["data"]["fold"]
+if not use_cfg_fold: experiment_name = experiment_name + f"_fold{use_fold}"
+experiment_path = project_path / 'registration_experiments' / (experiment_name + f"_{timestamp}")
+# writer = SummaryWriter(experiment_path)
+shutil.copyfile(src_path / config_path, experiment_path / "config.yaml")
+shutil.copyfile(src_path / lakefs_config_path, experiment_path / "lakefs_cfg.yaml")
+
+# create a datalist from the filepath
+input_path = Path(config["input_path"])
+if input_path.is_file() and '.json' in input_path.name.lower():
+    datalist  = DataList.from_json(filepath=input_path, lakefs_config=lakefs_config)
+else:
+    datalist = DataList.from_lakefs(data_config=config["data"], lakefs_config=lakefs_config, filepath=input_path, include_root=True)
+data_list = datalist.data
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 SSIM = SSIMMetric(spatial_dims=3, reduction='mean', data_range=1.0)
 PSNR = PSNRMetric(reduction='mean', max_val=1.0)
 MSE = MSEMetric(reduction='mean')
@@ -52,11 +101,19 @@ def normalize_image(image):
     image_max = image.max()
     return (image - image_min) / (image_max - image_min)
 
-def compute_metrics(fixed_np, warped_np, moving_np):
-    """Compute metrics between fixed and warped images."""
-    fixed_th = torch.from_numpy(fixed_np).squeeze().unsqueeze(0).unsqueeze(0)
-    warped_th = torch.from_numpy(warped_np).squeeze().unsqueeze(0).unsqueeze(0)
-    moving_th = torch.from_numpy(moving_np).squeeze().unsqueeze(0).unsqueeze(0)
+def compute_metrics(fixed_th, warped_th, moving_th, device):
+    """Compute metrics between fixed and warped images"""
+    fixed_th = fixed_th.permute(2, 1, 0)
+    fixed_th = fixed_th.unsqueeze(0).unsqueeze(0)
+    fixed_th = fixed_th.to(device=device)
+
+    warped_th = warped_th.permute(2, 1, 0)
+    warped_th = warped_th.unsqueeze(0).unsqueeze(0)
+    warped_th = warped_th.to(device=device)
+
+    moving_th = moving_th.permute(2, 1, 0)
+    moving_th = moving_th.unsqueeze(0).unsqueeze(0)
+    moving_th = moving_th.to(device=device)
     assert fixed_th.shape == warped_th.shape == moving_th.shape and len(fixed_th.shape) == 5, "Fixed and warped images must have the same shape of kind (B, C, D, H, W)"
     
     # Similarity metrics between fixed and warped image
@@ -80,6 +137,31 @@ def resize_volume(image, target_shape):
     resampler.SetTransform(transform)
     resampler.SetInterpolator(sitk.sitkLinear)
     return resampler.Execute(image)
+
+def save_to_lakefs_boto3(loader: LakeFSLoader, registered_np: np.ndarray, patient_id: str, eye: str, visit_id: str, repo:str, branch:str):
+    """
+    volume_np: registered volume as Numpy array [Z, Y, X]
+    output_path: full LakeFS path (e.g., 'lakefs://repo/main/data/OMEGA01/R/V02/Spectralis_oct/...')
+    """
+    # Convert to Nifti
+    affine = np.eye(4)
+    nifti_img = nib.Nifti1Image(registered_np, affine=affine)
+
+    # Write to an in-memory buffer
+    buffer = io.BytesIO()
+    nib.save(nifti_img, buffer)
+    buffer.seek(0)
+
+    # Construct LakeFS S3 key (path within repo)
+    object_key = f"{branch}/data/{patient_id}/{eye}/{visit_id}/Spectralis_oct/{patient_id}_{eye}_{visit_id}_registered.nii.gz"
+
+    # Upload to LakeFS
+    loader.lakefs.put_object(
+        Bucket=repo,
+        Key=object_key,
+        Body=buffer,
+        ContentType='application/gzip'  # Optional: hint that it's gzipped
+    )
 
 def resample_and_resize(fixed_image_path, moving_image_path):
     # transform_spacing = transforms.Spacing(pixdim=(0.0115234375, 0.0038716698, 0.030569948186528), mode='bilinear')
@@ -137,12 +219,13 @@ def resample_and_resize(fixed_image_path, moving_image_path):
 
 def register_and_evaluate(fixed_image_path, moving_image_path, patient, eye, followup_visit, method):
     start = time.time()
-    # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     fixed_resampled_sitk, moving_resampled_sitk = resample_and_resize(fixed_image_path, moving_image_path)
 
     # Registration with AirLab
     fixed_image_al = al.Image(fixed_resampled_sitk, dtype=sitk.sitkFloat64, device='cuda')
+    fixed_image_al = fixed_image_al.to(device=device)
     moving_image_al = al.Image(moving_resampled_sitk, dtype=sitk.sitkFloat64, device='cuda')
+    moving_image_al = moving_image_al.to(device=device)
     print(f"Fixed image airlab shape: {fixed_image_al.image.shape}, Moving image airlab shape: {moving_image_al.image.shape}")
 
     fixed_image_al, moving_image_al = al.utils.normalize_images(fixed_image_al, moving_image_al)
@@ -153,7 +236,7 @@ def register_and_evaluate(fixed_image_path, moving_image_path, patient, eye, fol
     registration = al.PairwiseRegistration(verbose=True)
 
     # define the transformation
-    transformation = al.transformation.pairwise.RigidTransformation(moving_image_al, opt_cm=False)
+    transformation = al.transformation.pairwise.RigidTransformation(moving_image_al, opt_cm=True)
     transformation.init_translation(fixed_image_al)
 
     registration.set_transformation(transformation)
@@ -175,51 +258,46 @@ def register_and_evaluate(fixed_image_path, moving_image_path, patient, eye, fol
     displacement = transformation.get_displacement()
     warped_image = al.transformation.utils.warp_image(moving_image_al, displacement)
     print('Warped image shape: ', warped_image.image.shape)
+    end = time.time()
+    print(f'Time for registration: {end-start}')
+    
     # compute metrics
-    psnr, ssim, mse, baseline_psnr, baseline_ssim, baseline_mse = compute_metrics(fixed_image_al.image.squeeze().cpu().numpy(), warped_image.image.squeeze().cpu().numpy(), moving_image_al.image.squeeze().cpu().numpy())
-
+    start = time.time()
+    psnr, ssim, mse, baseline_psnr, baseline_ssim, baseline_mse = compute_metrics(fixed_image_al.image.squeeze(), warped_image.image.squeeze(), moving_image_al.image.squeeze(), device)
+    end = time.time()
+    print(f'Time to compute metrics: {end-start}')
     # save warped image
+
     out_dir = os.path.join(OUTPUT_ROOT, patient, eye, followup_visit, method, 'common_voxel_spacing')
     os.makedirs(out_dir, exist_ok=True)
 
     warped_itk = warped_image.itk()
-    warped_np = sitk.GetArrayFromImage(warped_itk)
-    # warped_np = np.transpose(warped_np, (2, 1, 0))
-    # warped_itk = sitk.GetImageFromArray(warped_np)
-    # print('Warped_itk size: ', warped_itk.GetSize())
-    # sitk.WriteImage(warped_itk, os.path.join(out_dir, f'warped_{method}.nii.gz'))
+    print('Warped itk shape: ', warped_itk.GetSize())
+    transpose = sitk.PermuteAxesImageFilter()
+    transpose.SetOrder([2, 1, 0])
+    warped_itk_transposed = transpose.Execute(warped_itk)
+    print('Warped itk transposed shape: ', warped_itk_transposed.GetSize())
 
-    # nib.save(nib.Nifti1Image(warped_np, fixed_image_al.affine), os.path.join(out_dir, f'warped_{method}_second.nii.gz'))
-    if patient == 'OMEGA01':
-        # nib.save(nib.Nifti1Image(warped_image.numpy(), affine=fixed_image_al.image.affine), 
-        #         os.path.join(out_dir, f'{patient}_{eye}_{followup_visit}.nii.gz'))
-        warped_itk = warped_image.itk()
-        print('Warped itk shape: ', warped_itk.GetSize())
-        warped_np = sitk.GetArrayFromImage(warped_itk)
-        warped_np = np.transpose(warped_np, (2, 1, 0))
-        warped_transposed = sitk.GetImageFromArray(warped_np)
-        sitk.WriteImage(warped_transposed, os.path.join(out_dir, f'warped_{patient}_{eye}_{followup_visit}_{method}.nii.gz'))
-
-    end = time.time()
-
-    # save checkerboard
-    # Example slice index (axial middle slice)
-    slice_idx = fixed_image_al.image.shape[0] // 2
-
-    # Prepare figure and axes
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), constrained_layout=True)
-
-    # Titles for subplots
-    titles = ['Fixed', 'Moving', f'Warped ({method})']
+    start = time.time()
 
     # Images to plot
-    fixed_np = fixed_image_al.image.squeeze().cpu().numpy()
-    moving_np = moving_image_al.image.squeeze().cpu().numpy()
-    warped_np = warped_image.image.squeeze().cpu().numpy()
+    fixed_np = fixed_image_al.image.squeeze().permute(2, 1, 0).cpu().numpy()
+    moving_np = moving_image_al.image.squeeze().permute(2, 1, 0).cpu().numpy()
+    warped_np = warped_image.image.squeeze().permute(2, 1, 0).cpu().numpy()
 
     print('Fixed_np shape: ', fixed_np.shape)
     print('Moving_np shape: ', moving_np.shape)
     print('Warped_np shape: ', warped_np.shape)
+
+    # save checkerboard
+    # Example slice index (axial middle slice)
+    slice_idx = fixed_np.shape[0] // 2
+
+    # Prepare figure and axes
+    fig, axes = plt.subplots(1, 3, figsize=(10, 4), constrained_layout=True)
+
+    # Titles for subplots
+    titles = ['Fixed', 'Moving', f'Warped ({method})']
 
     # Plot XY plane --> frontal image
     images = [fixed_np[slice_idx, :, :],
@@ -244,9 +322,9 @@ def register_and_evaluate(fixed_image_path, moving_image_path, patient, eye, fol
     plt.close()
 
     # Plot YZ plane --> lateral image
-    slice_idx = fixed_image_al.image.shape[2] // 2
+    slice_idx = fixed_np.shape[2] // 2
     # Prepare figure and axes
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(10, 4), constrained_layout=True)
 
     images = [fixed_np[:, :, slice_idx],
             moving_np[:, :, slice_idx],
@@ -268,9 +346,9 @@ def register_and_evaluate(fixed_image_path, moving_image_path, patient, eye, fol
     plt.close()
 
     # Plot XZ plane --> from above image
-    slice_idx = fixed_image_al.image.shape[1] // 2
+    slice_idx = fixed_np.shape[1] // 2
     # Prepare figure and axes
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(10, 4), constrained_layout=True)
     images = [fixed_np[:, slice_idx, :],
             moving_np[:, slice_idx, :],
             warped_np[:, slice_idx, :]]
@@ -294,35 +372,53 @@ def register_and_evaluate(fixed_image_path, moving_image_path, patient, eye, fol
     diff_np = np.abs(fixed_np - warped_np)
     diff_baseline_np = np.abs(fixed_np - moving_np)
 
-    fig, axes = plt.subplots(1, 2, figsize=(16,4), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10,4), constrained_layout=True)
     images = [diff_baseline_np, diff_np]
     titles = ['Fixed-Moving', 'Fixed-Warped']
     cmaps = ['gray', 'gray']
     # Plot
     for ax, img, title, cmap in zip(axes, images, titles, cmaps):
-        im = ax.imshow(img, cmap=cmap)
+        im = ax.imshow(img[diff_baseline_np.shape[0] // 2, :, :], cmap=cmap)
         ax.set_title(title, fontsize=12)
         ax.axis('off')
         if title == 'Fixed-Warped':
             # Add a small colorbar only for the diff
             cbar = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
             cbar.ax.tick_params(labelsize=8)
+    outfile = os.path.join(out_dir, f'difference_maps_{method}.png')
+    plt.savefig(outfile, dpi=300, bbox_inches='tight')
+    plt.close()
+    end = time.time()
+    print(f'Time to generate and save plots: {end-start}')
 
-    return psnr, ssim, mse, baseline_psnr, baseline_ssim, baseline_mse
+    del fixed_image_al, moving_image_al, warped_image, warped_itk, fixed_resampled_sitk, moving_resampled_sitk
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return psnr, ssim, mse, baseline_psnr, baseline_ssim, baseline_mse, warped_itk_transposed
 
 def main():
     corrupted_cases = [
         ('OMEGA04', 'L', 'V02'),
     ]
-    #methods = []
+    # methods = []
     # psnr_means = []
     # ssim_means = []
     # mse_means = []
     # all_metrics = {method: [] for method in transformations}
     mse_all, psnr_all, ssim_all = [], [], []
     baseline_mse_all, baseline_psnr_all, baseline_ssim_all = [], [], []
+    lakefs_loader = LakeFSLoader(
+        local_cache_path=lakefs_config["cache_path"],
+        repo_name=lakefs_config["data_repository"],
+        branch_id=lakefs_config["branch"],
+        ca_path=lakefs_config["ca_path"],
+        endpoint=lakefs_config["s3_endpoint"],
+        secret_key=lakefs_config["secret_key"],
+        access_key=lakefs_config["access_key"],
+    )
     
-    with open(output_csv, 'w', newline='') as csvfile:
+    """with open(output_csv, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['patient','eye','visit','method','MSE', 'BASELINE_MSE', 'PSNR','BASELINE_PSNR', 'SSIM', 'BASELINE_SSIM'])
         for patient in sorted(os.listdir(DATA_ROOT)):
@@ -388,7 +484,54 @@ def main():
                         csvfile.flush()
                     except Exception as e:
                         print(f"Failed on {patient} {eye} {followup_visit}: {e}")
-                        traceback.print_exc()
+                        traceback.print_exc()"""
+    
+    volume_dict = defaultdict(dict)
+    pattern = r"(OMEGA\d{2})/(R|L)/(V\d{2})/Spectralis_oct/.*\.nii\.gz"
+    for file_path in sorted(data_list):
+        if 'OMEGA_04_271.nii.gz' in file_path:
+            continue
+        match = re.search(pattern, file_path)
+        if match:
+            patient_id, eye, visit_id = match.groups()
+            key = (patient_id, eye)
+            volume_dict[key][visit_id] = file_path
+    with open(output_csv, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['patient','eye','visit','method','MSE', 'BASELINE_MSE', 'PSNR','BASELINE_PSNR', 'SSIM', 'BASELINE_SSIM'])
+        for (patient_id, eye), visits in volume_dict.items():
+            baseline_path = visits.get("V01")
+            if not baseline_path:
+                print("No baseline (V01) for {patient_id} {eye}, skipping.")
+                continue
+            for visit_id, moving_path in visits.items():
+                if visit_id == "V01":
+                    continue
+                print(f"Registering {patient_id} {eye} {visit_id} to baseline...")
+                try:
+                    psnr_fixed_warped, ssim_fixed_warped, mse_fixed_warped, psnr_fixed_moving, ssim_fixed_moving, mse_fixed_moving, registered_volume = register_and_evaluate(
+                        baseline_path, moving_path, patient_id, eye, visit_id, "rigid"
+                    )
+                    mse_all.append(mse_fixed_warped.item())
+                    psnr_all.append(psnr_fixed_warped.item())
+                    ssim_all.append(ssim_fixed_warped.item())
+                    baseline_mse_all.append(mse_fixed_moving.item())
+                    baseline_psnr_all.append(psnr_fixed_moving.item())
+                    baseline_ssim_all.append(ssim_fixed_moving.item())
+                    writer.writerow([patient_id, eye, visit_id, "rigid", f"{mse_fixed_warped.item():.4f}", f"{mse_fixed_moving.item():.4f}", f"{psnr_fixed_warped.item():.4f}", f"{psnr_fixed_moving.item():.4f}", f"{ssim_fixed_warped.item():.4f}", f"{ssim_fixed_moving.item():.4f}"])
+                    csvfile.flush()
+                    save_to_lakefs_boto3(
+                        loader=lakefs_loader,
+                        registered_np=registered_volume.numpy(),
+                        patient_id=patient_id,
+                        eye=eye,
+                        visit_id=visit_id,
+                        repo=lakefs_config["data_repository"],
+                        branch=lakefs_config["branch"]
+                    )
+                except Exception as e:
+                    print(f"Error registering {patient_id} {eye} {visit_id}: {e}")
+                    traceback.print_exc()
 
     avg_mse, std_mse = np.mean(mse_all), np.std(mse_all)
     avg_psnr, std_psnr = np.mean(psnr_all), np.std(psnr_all)
