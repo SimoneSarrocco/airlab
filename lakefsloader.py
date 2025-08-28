@@ -6,7 +6,7 @@ import os
 import boto3
 import logging
 from pathlib import Path
-
+from botocore.config import Config
 from typing import Tuple, List
 
 class LakeFSLoader():

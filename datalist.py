@@ -107,6 +107,7 @@ class DataList():
             config: Dict,
             include_root: bool = True,
             shuffle: bool = True,
+            image_modality: str = 'Spectralis_oct',
             ):
         """
         Create datalist from a directory. It is expected that the directory has a subdirectory for each patient.
@@ -118,7 +119,12 @@ class DataList():
             shuffle: (bool): Shuffle the dataset
         """
         datapath = Path(datapath)
-        img_tag = config["img_tag"]
+        if image_modality == 'Spectralis_oct':
+            img_tag = '.nii.gz'
+        elif image_modality == 'Spectralis_slo':
+            img_tag = '.tiff'
+        else: 
+            img_tag = config["img_tag"]
         lbl_tag = config["lbl_tag"]
         random.seed(42)
 
@@ -137,21 +143,26 @@ class DataList():
         data = {"full_dataset": []}
 
         # populate testing data
-        for patient in patient_list:
-            # OMEGAxx --> L/R --> V01/V02/V03/V04 --> Spectralis_oct
+        for patient in sorted(patient_list):
+            # OMEGAxx --> OS/OD --> V01/V02/V03/V04 --> Spectralis_oct
             # get the img and label
             # patient_test_img = ''
-            for eye_dir in patient.glob('*'):
+            for eye_dir in sorted(patient.glob('*')):
                 if not eye_dir.is_dir():
                     continue
-                for visit_dir in eye_dir.glob('*'):
+                for visit_dir in sorted(eye_dir.glob('*')):
                     if not visit_dir.is_dir():
                         continue
-                    spec_oct = visit_dir / "Spectralis_oct"
-                    if not spec_oct.is_dir():
+                    spec_modality = visit_dir / image_modality
+                    if not spec_modality.is_dir():
                         continue
                     # Find image files matching img_tag
-                    img_files = [f for f in spec_oct.glob("*.nii.gz") if img_tag in f.name.lower()]
+                    if image_modality == 'Spectralis_oct':
+                        img_files = [f for f in spec_modality.glob("*.nii.gz") if img_tag in f.name.lower()]
+                    elif image_modality == 'Spectralis_slo':
+                        img_files = [f for f in spec_modality.glob("*.tiff") if img_tag in f.name.lower()]
+                    else: 
+                        img_files = [f for f in spec_modality.glob("*.dcm") if img_tag in f.name.lower()]
                     if not img_files:
                         continue
                     img_file = img_files[0]  # Take the first matching image file
@@ -188,6 +199,7 @@ class DataList():
         filepath: str = '',
         include_root: bool = True,
         shuffle: bool = True, 
+        image_modality: str = 'Spectralis_oct',
     ):
         """
         Create the datalist from the s3 storage
@@ -211,7 +223,12 @@ class DataList():
             )
 
         # iterate through the s3 objects, only considering the ones of interest
-        tags = data_config["img_tag"]
+        if image_modality == 'Spectralis_oct':
+            tags = '.nii.gz'
+        elif image_modality == 'Spectralis_slo':
+            tags = '.tiff'
+        else:
+            tags = data_config['img_tag']
         objects = lakefs_loader.read_s3_objects(filter=tags, prefix=filepath)
         logging.info(f"Creating a datalist from {len(objects)} files.")
 
@@ -228,6 +245,7 @@ class DataList():
             config=data_config,
             include_root=include_root,
             shuffle=shuffle,
+            image_modality=image_modality,
             )
 
     def save_datalist_to_json(self, path: Path, remember_path: bool = True) -> None:
